@@ -2,11 +2,15 @@
 
 This is an unofficial fork of [OpenAI Codex](https://github.com/openai/codex). It is not affiliated with, endorsed by, or sponsored by OpenAI.
 
-This fork reduces startup memory spikes caused by local session metadata backfill. Upstream Codex metadata extraction loaded each rollout JSONL file fully into memory before parsing it. Very large files under `~/.codex/sessions` or `~/.codex/archived_sessions` could therefore produce large transient memory usage during startup. This fork changes that metadata extraction path to stream rollout files line by line.
+This fork reduces memory spikes caused by very large local session rollout files. Upstream Codex metadata extraction loaded each rollout JSONL file fully into memory before parsing it. Very large files under `~/.codex/sessions` or `~/.codex/archived_sessions` could therefore produce large transient memory usage during startup. This fork changes that metadata extraction path to stream rollout files line by line.
+
+It also adds a defensive guard for full thread-history loads. If a rollout file is larger than 512 MiB, Desktop history APIs reject the full history load instead of parsing the entire file into memory. This prevents unusually large old sessions from pushing the app-server process into tens of GB of memory.
 
 Important notes:
 
-- This changes metadata backfill/reconciliation only; resuming a specific thread can still load that thread's full history.
+- This is an experimental, unofficial fork tested on one macOS setup.
+- Very large old sessions over 512 MiB may not open, resume, fork, roll back, or list turns fully in Desktop.
+- Normal new chats and model requests are not intentionally changed.
 - A single very large JSONL line still has to be read and parsed as one line.
 - Existing huge session files may still consume disk space and can still slow startup, though peak memory should be much lower.
 - This fork keeps the original Apache-2.0 license and upstream attribution. Do not treat it as an official OpenAI build.

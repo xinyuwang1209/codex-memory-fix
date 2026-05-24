@@ -25,6 +25,8 @@ use crate::StoredThreadHistory;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+const MAX_ROLLOUT_HISTORY_LOAD_BYTES: u64 = 512 * 1024 * 1024;
+
 pub(super) async fn read_thread(
     store: &LocalThreadStore,
     params: ReadThreadParams,
@@ -155,8 +157,32 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
+    ensure_rollout_history_is_small_enough(&path, thread_id).await?;
     let items = load_history_items(&path).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
+    Ok(())
+}
+
+async fn ensure_rollout_history_is_small_enough(
+    path: &std::path::Path,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<()> {
+    let size = tokio::fs::metadata(path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to stat thread history {}: {err}", path.display()),
+        })?
+        .len();
+    if size > MAX_ROLLOUT_HISTORY_LOAD_BYTES {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "thread {thread_id} history is too large to load safely ({} MiB > {} MiB): {}",
+                size / 1024 / 1024,
+                MAX_ROLLOUT_HISTORY_LOAD_BYTES / 1024 / 1024,
+                path.display()
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -482,6 +508,38 @@ mod tests {
             Some(std::fs::canonicalize(active_path).expect("canonical path"))
         );
         assert_eq!(thread.preview, "Hello from user");
+    }
+
+    #[tokio::test]
+    async fn read_thread_rejects_oversized_history_load() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(212);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let active_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active_path)
+            .expect("open session file");
+        file.set_len(MAX_ROLLOUT_HISTORY_LOAD_BYTES + 1)
+            .expect("extend session file sparsely");
+
+        let err = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: true,
+            })
+            .await
+            .expect_err("oversized history should fail");
+
+        match err {
+            ThreadStoreError::InvalidRequest { message } => {
+                assert!(message.contains("history is too large to load safely"));
+            }
+            err => panic!("unexpected error: {err}"),
+        }
     }
 
     #[tokio::test]
