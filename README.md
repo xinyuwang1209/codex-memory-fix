@@ -6,6 +6,13 @@ This fork reduces memory spikes caused by very large local session rollout files
 
 It also adds a defensive guard for full thread-history loads. If a rollout file is larger than 512 MiB, Desktop history APIs reject the full history load instead of parsing the entire file into memory. This prevents unusually large old sessions from pushing the app-server process into tens of GB of memory.
 
+Desktop Computer Use limitation:
+
+- Unofficial Desktop app bundles built from this fork cannot preserve OpenAI's Developer ID signature or team identifier.
+- Local patched Desktop builds are typically ad-hoc signed, which can break macOS permission and helper validation paths used by Codex Computer Use.
+- In local testing, Computer Use helpers could start but `get_app_state` / `list_apps` timed out under an ad-hoc signed patched Desktop app.
+- The Rust memory patches do not intentionally disable Computer Use, but a fully working Desktop Computer Use experience likely requires an official OpenAI-signed build or an upstream release containing these fixes.
+
 Important notes:
 
 - This is an experimental, unofficial fork tested on one macOS setup.
