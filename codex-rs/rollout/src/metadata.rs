@@ -2,7 +2,7 @@ use crate::ARCHIVED_SESSIONS_SUBDIR;
 use crate::SESSIONS_SUBDIR;
 use crate::list;
 use crate::list::parse_timestamp_uuid_from_filename;
-use crate::recorder::RolloutRecorder;
+use crate::recorder::strip_legacy_ghost_snapshot_rollout_line;
 use crate::state_db::normalize_cwd_for_state_db;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
@@ -11,6 +11,7 @@ use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -23,8 +24,10 @@ use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::apply_rollout_item;
+use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
+use tokio::io::AsyncBufReadExt;
 use tracing::info;
 use tracing::warn;
 
@@ -98,36 +101,75 @@ pub async fn extract_metadata_from_rollout(
     rollout_path: &Path,
     default_provider: &str,
 ) -> anyhow::Result<ExtractionOutcome> {
-    let (items, _thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(rollout_path).await?;
-    if items.is_empty() {
+    let fallback_builder = builder_from_items(&[], rollout_path);
+    let mut metadata = fallback_builder
+        .as_ref()
+        .map(|builder| builder.build(default_provider));
+    let mut parse_errors = 0usize;
+    let mut saw_item = false;
+    let mut memory_mode = None;
+
+    let file = tokio::fs::File::open(rollout_path).await?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("failed to parse line as JSON: {line:?}, error: {err}");
+                parse_errors = parse_errors.saturating_add(1);
+                continue;
+            }
+        };
+        if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let rollout_line = match serde_json::from_value::<RolloutLine>(value) {
+            Ok(rollout_line) => rollout_line,
+            Err(err) => {
+                tracing::trace!("failed to parse rollout line: {err}");
+                parse_errors = parse_errors.saturating_add(1);
+                continue;
+            }
+        };
+        saw_item = true;
+        if metadata.is_none()
+            && let RolloutItem::SessionMeta(session_meta) = &rollout_line.item
+            && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
+        {
+            metadata = Some(builder.build(default_provider));
+        }
+        if let RolloutItem::SessionMeta(session_meta) = &rollout_line.item
+            && let Some(mode) = session_meta.meta.memory_mode.as_ref()
+        {
+            memory_mode = Some(mode.clone());
+        }
+        if let Some(metadata) = metadata.as_mut() {
+            apply_rollout_item(metadata, &rollout_line.item, default_provider);
+        }
+    }
+
+    if !saw_item {
         return Err(anyhow::anyhow!(
             "empty session file: {}",
             rollout_path.display()
         ));
     }
-    let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
+    let mut metadata = metadata.ok_or_else(|| {
         anyhow::anyhow!(
             "rollout missing metadata builder: {}",
             rollout_path.display()
         )
     })?;
-    let mut metadata = builder.build(default_provider);
-    for item in &items {
-        apply_rollout_item(&mut metadata, item, default_provider);
-    }
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
     }
     Ok(ExtractionOutcome {
         metadata,
-        memory_mode: items.iter().rev().find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::EventMsg(_) => None,
-        }),
+        memory_mode,
         parse_errors,
     })
 }

@@ -923,7 +923,7 @@ impl RolloutRecorder {
     }
 }
 
-fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
+pub(crate) fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
     match value.get("type").and_then(Value::as_str) {
         Some("response_item") => value
             .get("payload")

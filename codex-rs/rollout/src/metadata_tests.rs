@@ -7,12 +7,14 @@ use chrono::Timelike;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_state::BackfillStatus;
 use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
@@ -136,6 +138,77 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
         .expect("extract");
 
     assert_eq!(outcome.memory_mode.as_deref(), Some("polluted"));
+}
+
+#[tokio::test]
+async fn extract_metadata_from_rollout_streams_large_rollout_lines() {
+    let dir = tempdir().expect("tempdir");
+    let uuid = Uuid::new_v4();
+    let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = dir
+        .path()
+        .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
+
+    let session_meta = SessionMeta {
+        id,
+        forked_from_id: None,
+        timestamp: "2026-01-27T12:34:56Z".to_string(),
+        cwd: dir.path().to_path_buf(),
+        originator: "cli".to_string(),
+        cli_version: "0.0.0".to_string(),
+        source: SessionSource::default(),
+        thread_source: None,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+        model_provider: Some("openai".to_string()),
+        base_instructions: None,
+        dynamic_tools: None,
+        memory_mode: Some("enabled".to_string()),
+    };
+    let lines = vec![
+        RolloutLine {
+            timestamp: "2026-01-27T12:34:56Z".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: session_meta,
+                git: None,
+            }),
+        },
+        RolloutLine {
+            timestamp: "2026-01-27T12:35:00Z".to_string(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: format!("hello {}", "x".repeat(2 * 1024 * 1024)),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            })),
+        },
+    ];
+    let mut file = File::create(&path).expect("create rollout");
+    for line in lines {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&line).expect("serialize rollout line")
+        )
+        .expect("write rollout line");
+    }
+
+    let outcome = extract_metadata_from_rollout(&path, "openai")
+        .await
+        .expect("extract");
+
+    assert_eq!(outcome.metadata.id, id);
+    assert_eq!(outcome.memory_mode.as_deref(), Some("enabled"));
+    assert_eq!(outcome.parse_errors, 0);
+    assert!(
+        outcome
+            .metadata
+            .first_user_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("hello "))
+    );
 }
 
 #[test]
